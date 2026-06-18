@@ -8,6 +8,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import ytdl from 'ytdl-core';
 import ytSearch from 'yt-search';
 import axios from 'axios';
+import qrcode from 'qrcode-terminal';
 
 const { Client, LocalAuth, MessageMedia } = wweb;
 
@@ -438,12 +439,18 @@ async function initialize() {
     client = createClient();
 
     client.on('qr', async (qr) => {
+        // Mostrar QR visual en logs
+        console.log('\n🔳 ESCANEA ESTE QR CON WHATSAPP:\n');
+        qrcode.generate(qr, { small: true });
+        console.log('\n📱 O ve a WhatsApp > Dispositivos vinculados > Vincular un dispositivo\n');
+        
+        // También intentar el código por si acaso
         try {
             const pairingCode = await client.requestPairingCode(PHONE_NUMBER);
             console.log('\n🔑 CÓDIGO DE VINCULACIÓN:', pairingCode);
             console.log('📱 WhatsApp > Dispositivos vinculados > Vincular con código\n');
         } catch (err) {
-            console.error('❌ Error al generar código:', err.message);
+            console.log('⚠️  Código no disponible, usa el QR de arriba');
         }
     });
 
