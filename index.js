@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { Blob } from 'buffer';
 import fs from 'fs';
 import path from 'path';
+import http from 'http';
 import wweb from 'whatsapp-web.js';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import ytdl from 'ytdl-core';
@@ -29,7 +30,17 @@ if (!GEMINI_API_KEY) {
     process.exit(1);
 }
 
-// ---------- IA (Modelo corregido) ----------
+// ---------- SERVIDOR HTTP (mantiene vivo Render) ----------
+const PORT = process.env.PORT || 10000;
+const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Bot WhatsApp activo ✅');
+});
+server.listen(PORT, () => {
+    console.log(`🌐 Servidor HTTP en puerto ${PORT}`);
+});
+
+// ---------- IA ----------
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 let model;
 try {
@@ -108,8 +119,6 @@ async function downloadVideo(url) {
 
 async function searchImage(query) {
     console.log(`🔍 Buscando imagen: "${query}"`);
-    
-    // Método 1: Pixabay (API pública gratuita)
     try {
         const res = await axios.get('https://pixabay.com/api/', {
             params: {
@@ -128,8 +137,6 @@ async function searchImage(query) {
     } catch (err) {
         console.log('⚠️  Pixabay falló, intentando alternativa...');
     }
-    
-    // Método 2: Unsplash
     try {
         const encodedQuery = encodeURIComponent(query);
         const unsplashUrl = `https://source.unsplash.com/featured/?${encodedQuery}`;
@@ -148,8 +155,6 @@ async function searchImage(query) {
             return err.response.headers.location;
         }
     }
-    
-    // Método 3: Imagen de respaldo
     console.log('⚠️  Usando imagen de respaldo');
     return `https://picsum.photos/800/600?random=${Date.now()}`;
 }
@@ -256,7 +261,6 @@ También respondo si me etiquetan.`;
                     await msg.reply(welcome);
                     break;
                 }
-
                 case 'musica': {
                     if (!argText) { await msg.reply('⚠️ Escribe el nombre de la canción'); break; }
                     await msg.reply('🔍 Buscando en YouTube...');
@@ -271,11 +275,10 @@ También respondo si me etiquetan.`;
                         fs.promises.unlink(audioPath).catch(() => {});
                     } catch (err) {
                         console.error('Error en música:', err);
-                        await msg.reply('❌ Error al buscar/descargar. Puede que YouTube esté bloqueado.');
+                        await msg.reply('❌ Error al buscar/descargar.');
                     }
                     break;
                 }
-
                 case 'descargar': {
                     if (!argText) { await msg.reply('⚠️ Proporciona un enlace de YouTube'); break; }
                     if (!ytdl.validateURL(argText)) {
@@ -294,7 +297,6 @@ También respondo si me etiquetan.`;
                     }
                     break;
                 }
-
                 case 'hablar': {
                     const personality = personalityMap.get(msg.from) || 'pana';
                     let prompt;
@@ -307,8 +309,7 @@ También respondo si me etiquetan.`;
                     }
                     try {
                         const result = await model.generateContent(prompt);
-                        const response = result.response.text();
-                        await msg.reply(response);
+                        await msg.reply(result.response.text());
                     } catch (err) {
                         console.error('Error en Gemini:', err.message);
                         try {
@@ -317,13 +318,11 @@ También respondo si me etiquetan.`;
                             const result = await fallbackModel.generateContent(prompt);
                             await msg.reply(result.response.text());
                         } catch (fallbackErr) {
-                            console.error('Error también con fallback:', fallbackErr.message);
-                            await msg.reply('❌ Error al generar respuesta. Modelo no disponible.');
+                            await msg.reply('❌ Error al generar respuesta.');
                         }
                     }
                     break;
                 }
-
                 case 'pin': {
                     if (!argText) { await msg.reply('⚠️ Dime qué imagen buscar'); break; }
                     await msg.reply(`🔍 Buscando imagen de "${argText}"...`);
@@ -337,7 +336,6 @@ También respondo si me etiquetan.`;
                     }
                     break;
                 }
-
                 case 'meme': {
                     await msg.reply('🔍 Buscando meme...');
                     const memeUrl = await getRandomMeme();
@@ -346,7 +344,6 @@ También respondo si me etiquetan.`;
                     await client.sendMessage(msg.from, media, { caption: 'Meme del día' });
                     break;
                 }
-
                 case 'personalidad': {
                     const tipo = argText.toLowerCase();
                     if (tipo === 'seria') {
@@ -360,91 +357,44 @@ También respondo si me etiquetan.`;
                     }
                     break;
                 }
-
                 case 'close': {
-                    if (!isGroup) { 
-                        await msg.reply('❌ Este comando solo funciona en grupos'); 
-                        break; 
-                    }
-                    
+                    if (!isGroup) { await msg.reply('❌ Solo en grupos'); break; }
                     const authorId = msg.author || msg.from;
-                    console.log(`🔒 Intento de cerrar grupo por: ${authorId}`);
-                    
                     await chat.fetchMessages({ limit: 1 });
-                    
                     const participant = chat.participants.find(p => {
                         const pId = p.id._serialized || p.id.user || p.id;
                         return pId === authorId || pId.includes(authorId.split('@')[0]) || authorId.includes(pId.split('@')[0]);
                     });
-                    
-                    if (!participant) {
-                        console.log('❌ No se encontró al usuario en la lista de participantes');
-                        await msg.reply('❌ No pude verificar tu identidad. Intenta de nuevo.');
+                    if (!participant || !participant.isAdmin) {
+                        await msg.reply('❌ Solo administradores');
                         break;
                     }
-                    
-                    console.log(`👤 Participante encontrado: ${participant.id._serialized}, isAdmin: ${participant.isAdmin}`);
-                    
-                    if (!participant.isAdmin) {
-                        await msg.reply('❌ Solo los administradores pueden cerrar el grupo');
-                        break;
-                    }
-                    
-                    try {
-                        await chat.setMessagesAdminsOnly(true);
-                        await msg.reply('🔒 Grupo cerrado: solo administradores pueden enviar mensajes');
-                    } catch (err) {
-                        console.error('Error al cerrar grupo:', err);
-                        await msg.reply('❌ No se pudo cerrar el grupo. Verifica que el bot sea administrador.');
-                    }
+                    await chat.setMessagesAdminsOnly(true);
+                    await msg.reply('🔒 Grupo cerrado');
                     break;
                 }
-
                 case 'open': {
-                    if (!isGroup) { 
-                        await msg.reply('❌ Este comando solo funciona en grupos'); 
-                        break; 
-                    }
-                    
+                    if (!isGroup) { await msg.reply('❌ Solo en grupos'); break; }
                     const authorId = msg.author || msg.from;
-                    console.log(`🔓 Intento de abrir grupo por: ${authorId}`);
-                    
                     await chat.fetchMessages({ limit: 1 });
-                    
                     const participant = chat.participants.find(p => {
                         const pId = p.id._serialized || p.id.user || p.id;
                         return pId === authorId || pId.includes(authorId.split('@')[0]) || authorId.includes(pId.split('@')[0]);
                     });
-                    
-                    if (!participant) {
-                        console.log('❌ No se encontró al usuario en la lista de participantes');
-                        await msg.reply('❌ No pude verificar tu identidad. Intenta de nuevo.');
+                    if (!participant || !participant.isAdmin) {
+                        await msg.reply('❌ Solo administradores');
                         break;
                     }
-                    
-                    console.log(`👤 Participante encontrado: ${participant.id._serialized}, isAdmin: ${participant.isAdmin}`);
-                    
-                    if (!participant.isAdmin) {
-                        await msg.reply('❌ Solo los administradores pueden abrir el grupo');
-                        break;
-                    }
-                    
-                    try {
-                        await chat.setMessagesAdminsOnly(false);
-                        await msg.reply('🔓 Grupo abierto: todos pueden enviar mensajes');
-                    } catch (err) {
-                        console.error('Error al abrir grupo:', err);
-                        await msg.reply('❌ No se pudo abrir el grupo. Verifica que el bot sea administrador.');
-                    }
+                    await chat.setMessagesAdminsOnly(false);
+                    await msg.reply('🔓 Grupo abierto');
                     break;
                 }
-
                 default:
                     await msg.reply('❓ Comando no existente');
             }
         } catch (err) {
             console.error('Error en comando:', err);
-            await msg.reply('❌ Ocurrió un error al procesar el comando.');
+            await msg.reply('❌ Error al procesar el comando.');
         }
         return;
     }
@@ -454,7 +404,7 @@ También respondo si me etiquetan.`;
         await safeTyping(chat);
         await delay(3000 + Math.random() * 2000);
         const personality = personalityMap.get(msg.from) || 'pana';
-        const prompt = `Te mencionaron en un grupo. Personalidad: ${personality}. Responde al mensaje: "${body}". Responde en español. No menciones IA.`;
+        const prompt = `Te mencionaron. Personalidad: ${personality}. Mensaje: "${body}". Responde en español. No menciones IA.`;
         try {
             const result = await model.generateContent(prompt);
             await msg.reply(result.response.text());
@@ -464,7 +414,7 @@ También respondo si me etiquetan.`;
         return;
     }
 
-    // Chat privado sin comando
+    // Chat privado
     if (!isGroup && body) {
         await safeTyping(chat);
         await delay(3000 + Math.random() * 2000);
