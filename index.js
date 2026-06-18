@@ -31,14 +31,66 @@ if (!GEMINI_API_KEY) {
     process.exit(1);
 }
 
-// ---------- SERVIDOR HTTP (mantiene vivo Render) ----------
+// Variable global para guardar el QR
+let currentQR = null;
+
+// ---------- SERVIDOR HTTP (mantiene vivo Render + muestra QR) ----------
 const PORT = process.env.PORT || 10000;
 const server = http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Bot WhatsApp activo ✅');
+    if (req.url === '/qr' && currentQR) {
+        // Mostrar QR como página web escaneable
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(`
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>QR WhatsApp - Escanea con tu celular</title>
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <style>
+                    body { 
+                        background: #111; 
+                        display: flex; 
+                        justify-content: center; 
+                        align-items: center; 
+                        min-height: 100vh; 
+                        margin: 0;
+                        flex-direction: column;
+                    }
+                    #qr-container { 
+                        background: white; 
+                        padding: 20px; 
+                        border-radius: 15px;
+                    }
+                    h2 { color: white; font-family: Arial; margin-bottom: 20px; }
+                </style>
+            </head>
+            <body>
+                <h2>📱 Escanea este QR con WhatsApp</h2>
+                <div id="qr-container"></div>
+                <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
+                <script>
+                    new QRCode(document.getElementById("qr-container"), {
+                        text: "${currentQR.replace(/"/g, '\\"')}",
+                        width: 400,
+                        height: 400,
+                        colorDark: "#000000",
+                        colorLight: "#ffffff"
+                    });
+                </script>
+            </body>
+            </html>
+        `);
+    } else if (req.url === '/qr' && !currentQR) {
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end('<h1 style="text-align:center;margin-top:100px;">⏳ QR no disponible aún. Recarga en unos segundos.</h1>');
+    } else {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('Bot WhatsApp activo ✅\n\nPara ver el QR: ' + process.env.RENDER_EXTERNAL_URL + '/qr');
+    }
 });
 server.listen(PORT, () => {
     console.log(`🌐 Servidor HTTP en puerto ${PORT}`);
+    console.log(`📱 Para escanear el QR abre: ${process.env.RENDER_EXTERNAL_URL || 'http://localhost:' + PORT}/qr`);
 });
 
 // ---------- IA ----------
@@ -439,28 +491,32 @@ async function initialize() {
     client = createClient();
 
     client.on('qr', async (qr) => {
-        // Mostrar QR visual en logs
-        console.log('\n🔳 ESCANEA ESTE QR CON WHATSAPP:\n');
-        qrcode.generate(qr, { small: true });
-        console.log('\n📱 O ve a WhatsApp > Dispositivos vinculados > Vincular un dispositivo\n');
+        // Guardar QR para mostrarlo en la web
+        currentQR = qr;
         
-        // También intentar el código por si acaso
+        console.log('\n📱 QR DISPONIBLE. Ábrelo en tu navegador:');
+        console.log(`👉 ${process.env.RENDER_EXTERNAL_URL || 'http://localhost:' + PORT}/qr`);
+        console.log('\nO escanea el QR de abajo:\n');
+        qrcode.generate(qr, { small: true });
+        
+        // Intentar código también
         try {
             const pairingCode = await client.requestPairingCode(PHONE_NUMBER);
             console.log('\n🔑 CÓDIGO DE VINCULACIÓN:', pairingCode);
-            console.log('📱 WhatsApp > Dispositivos vinculados > Vincular con código\n');
         } catch (err) {
-            console.log('⚠️  Código no disponible, usa el QR de arriba');
+            console.log('⚠️  Usa el QR en la URL de arriba');
         }
     });
 
     client.on('ready', () => {
         console.log('✅ BOT CONECTADO Y LISTO');
+        currentQR = null;
         reconnectAttempt = 0;
     });
 
     client.on('disconnected', async (reason) => {
         console.log(`❌ Desconectado: ${reason}`);
+        currentQR = null;
         await reconnect();
     });
 
