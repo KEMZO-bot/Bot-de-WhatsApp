@@ -1,26 +1,16 @@
 import 'dotenv/config';
-import { Blob } from 'buffer';
 import fs from 'fs';
 import path from 'path';
 import http from 'http';
-import wweb from 'whatsapp-web.js';
+import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } from '@whiskeysockets/baileys';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import ytdl from 'ytdl-core';
 import ytSearch from 'yt-search';
 import axios from 'axios';
 import qrcode from 'qrcode-terminal';
+import Pino from 'pino';
 
-const { Client, LocalAuth, MessageMedia } = wweb;
-
-// Polyfill para File
-if (typeof global.File === 'undefined') {
-    global.File = class File extends Blob {
-        constructor(parts, name, options) {
-            super(parts, options);
-            this.name = name;
-        }
-    };
-}
+const logger = Pino({ level: 'silent' });
 
 // ---------- CONFIGURACIÓN ----------
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
@@ -31,516 +21,272 @@ if (!GEMINI_API_KEY) {
     process.exit(1);
 }
 
-// Variable global para guardar el QR
+// ---------- SERVIDOR HTTP ----------
+const PORT = process.env.PORT || 10000;
+let sock = null;
 let currentQR = null;
 
-// ---------- SERVIDOR HTTP (mantiene vivo Render + muestra QR) ----------
-const PORT = process.env.PORT || 10000;
 const server = http.createServer((req, res) => {
     if (req.url === '/qr' && currentQR) {
-        // Mostrar QR como página web escaneable
         res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end(`
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <title>QR WhatsApp - Escanea con tu celular</title>
-                <meta name="viewport" content="width=device-width, initial-scale=1">
-                <style>
-                    body { 
-                        background: #111; 
-                        display: flex; 
-                        justify-content: center; 
-                        align-items: center; 
-                        min-height: 100vh; 
-                        margin: 0;
-                        flex-direction: column;
-                    }
-                    #qr-container { 
-                        background: white; 
-                        padding: 20px; 
-                        border-radius: 15px;
-                    }
-                    h2 { color: white; font-family: Arial; margin-bottom: 20px; }
-                </style>
-            </head>
-            <body>
-                <h2>📱 Escanea este QR con WhatsApp</h2>
-                <div id="qr-container"></div>
-                <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
-                <script>
-                    new QRCode(document.getElementById("qr-container"), {
-                        text: "${currentQR.replace(/"/g, '\\"')}",
-                        width: 400,
-                        height: 400,
-                        colorDark: "#000000",
-                        colorLight: "#ffffff"
-                    });
-                </script>
-            </body>
-            </html>
-        `);
-    } else if (req.url === '/qr' && !currentQR) {
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end('<h1 style="text-align:center;margin-top:100px;">⏳ QR no disponible aún. Recarga en unos segundos.</h1>');
+        res.end(`<!DOCTYPE html><html><head><title>QR WhatsApp</title><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{background:#111;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;flex-direction:column}#qrcode{background:white;padding:20px;border-radius:15px}h2{color:white;font-family:Arial;margin-bottom:20px}</style></head><body><h2>📱 Escanea este QR</h2><div id="qrcode"></div><script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script><script>new QRCode(document.getElementById("qrcode"),{text:"${currentQR.replace(/"/g,'\\"')}",width:350,height:350})</script></body></html>`);
     } else {
         res.writeHead(200, { 'Content-Type': 'text/plain' });
-        res.end('Bot WhatsApp activo ✅\n\nPara ver el QR: ' + process.env.RENDER_EXTERNAL_URL + '/qr');
+        res.end('Bot activo ✅');
     }
 });
-server.listen(PORT, () => {
-    console.log(`🌐 Servidor HTTP en puerto ${PORT}`);
-    console.log(`📱 Para escanear el QR abre: ${process.env.RENDER_EXTERNAL_URL || 'http://localhost:' + PORT}/qr`);
-});
+server.listen(PORT, () => console.log(`🌐 Servidor en puerto ${PORT}`));
 
 // ---------- IA ----------
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-let model;
-try {
-    model = genAI.getGenerativeModel({ model: "gemini-2.0-flash-exp" });
-    console.log('✅ Usando modelo: gemini-2.0-flash-exp');
-} catch (err) {
-    console.log('⚠️  Modelo nuevo no disponible, usando gemini-pro');
-    model = genAI.getGenerativeModel({ model: "gemini-pro" });
-}
+const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+console.log('✅ Modelo IA listo');
 
-// Cola de concurrencia
-class AsyncQueue {
-    constructor(concurrency = 2) {
-        this.concurrency = concurrency;
-        this.running = 0;
-        this.queue = [];
-    }
-    async run(task) {
-        if (this.running >= this.concurrency) {
-            await new Promise(resolve => this.queue.push(resolve));
-        }
-        this.running++;
-        try { await task(); } finally {
-            this.running--;
-            if (this.queue.length > 0) {
-                const next = this.queue.shift();
-                next();
-            }
-        }
-    }
-}
-const messageQueue = new AsyncQueue(2);
-
+// ---------- ESTADOS ----------
 const messageStore = new Map();
 const personalityMap = new Map();
 const userSpamCount = new Map();
-const spamPhrases = [
-    "Dejen de joder, ando ocupado",
-    "¿Tanto mensaje? Relájate",
-    "No me hagas explotar, dame un respiro",
-    "Escribe más lento, humano",
-];
+const spamPhrases = ["Dejen de joder, ando ocupado", "¿Tanto mensaje? Relájate", "No me hagas explotar, dame un respiro", "Escribe más lento, humano"];
 
-// ---------- FUNCIONES AUXILIARES ----------
-async function safeTyping(chat) {
-    try { await Promise.race([chat.sendStateTyping(), new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 5000))]); } catch {}
-}
-async function safeRecording(chat) {
-    try { await Promise.race([chat.sendStateRecording(), new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 5000))]); } catch {}
-}
-function delay(ms) { return new Promise(res => setTimeout(res, ms)); }
+// ---------- FUNCIONES ----------
+function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function downloadAudio(url) {
-    const filePath = path.join('/tmp', `audio_${Date.now()}.mp3`);
+    const fp = path.join('/tmp', `audio_${Date.now()}.mp3`);
     return new Promise((resolve, reject) => {
-        const stream = ytdl(url, { filter: 'audioonly', quality: 'lowestaudio', highWaterMark: 1 << 16 });
-        const writeStream = fs.createWriteStream(filePath);
-        stream.pipe(writeStream);
-        writeStream.on('finish', () => resolve(filePath));
-        writeStream.on('error', reject);
-        stream.on('error', reject);
+        const s = ytdl(url, { filter: 'audioonly', quality: 'lowestaudio', highWaterMark: 1 << 16 });
+        const w = fs.createWriteStream(fp);
+        s.pipe(w);
+        w.on('finish', () => resolve(fp));
+        w.on('error', reject);
+        s.on('error', reject);
     });
 }
 
 async function downloadVideo(url) {
-    const filePath = path.join('/tmp', `video_${Date.now()}.mp4`);
+    const fp = path.join('/tmp', `video_${Date.now()}.mp4`);
     return new Promise((resolve, reject) => {
-        const stream = ytdl(url, { quality: 'lowest', highWaterMark: 1 << 16 });
-        const writeStream = fs.createWriteStream(filePath);
-        stream.pipe(writeStream);
-        writeStream.on('finish', () => resolve(filePath));
-        writeStream.on('error', reject);
-        stream.on('error', reject);
+        const s = ytdl(url, { quality: 'lowest', highWaterMark: 1 << 16 });
+        const w = fs.createWriteStream(fp);
+        s.pipe(w);
+        w.on('finish', () => resolve(fp));
+        w.on('error', reject);
+        s.on('error', reject);
     });
 }
 
 async function searchImage(query) {
-    console.log(`🔍 Buscando imagen: "${query}"`);
     try {
-        const res = await axios.get('https://pixabay.com/api/', {
-            params: {
-                key: '25516218-6e8b5e2a1f1c3d0e8b5e2a1f1',
-                q: query,
-                per_page: 3,
-                safesearch: 'true'
-            },
-            timeout: 10000
-        });
-        if (res.data.hits && res.data.hits.length > 0) {
-            const imageUrl = res.data.hits[0].largeImageURL || res.data.hits[0].webformatURL;
-            console.log('✅ Imagen encontrada en Pixabay');
-            return imageUrl;
-        }
-    } catch (err) {
-        console.log('⚠️  Pixabay falló, intentando alternativa...');
-    }
-    try {
-        const encodedQuery = encodeURIComponent(query);
-        const unsplashUrl = `https://source.unsplash.com/featured/?${encodedQuery}`;
-        const res = await axios.head(unsplashUrl, {
-            maxRedirects: 0,
-            validateStatus: status => status === 302 || status === 200,
-            timeout: 10000
-        });
-        if (res.headers.location) {
-            console.log('✅ Imagen encontrada en Unsplash');
-            return res.headers.location;
-        }
-    } catch (err) {
-        if (err.response?.headers?.location) {
-            console.log('✅ Imagen encontrada en Unsplash (redirect)');
-            return err.response.headers.location;
-        }
-    }
-    console.log('⚠️  Usando imagen de respaldo');
+        const r = await axios.get('https://pixabay.com/api/', { params: { key: '25516218-6e8b5e2a1f1c3d0e8b5e2a1f1', q: query, per_page: 3 }, timeout: 10000 });
+        if (r.data.hits?.length) return r.data.hits[0].largeImageURL || r.data.hits[0].webformatURL;
+    } catch {}
     return `https://picsum.photos/800/600?random=${Date.now()}`;
 }
 
 async function getRandomMeme() {
-    try {
-        const res = await axios.get('https://meme-api.com/gimme');
-        return res.data.url;
-    } catch (err) {
-        console.error('Error al obtener meme:', err);
-        return null;
-    }
+    try { const r = await axios.get('https://meme-api.com/gimme'); return r.data.url; }
+    catch { return null; }
 }
 
-function checkSpam(userId) {
+function checkSpam(uid) {
     const now = Date.now();
-    const record = userSpamCount.get(userId);
-    if (!record || (now - record.firstTime) > 5000) {
-        userSpamCount.set(userId, { count: 1, firstTime: now });
-        return false;
-    }
-    record.count++;
-    if (record.count > 3) {
-        userSpamCount.set(userId, { count: 1, firstTime: now });
-        return true;
-    }
+    const rec = userSpamCount.get(uid);
+    if (!rec || (now - rec.firstTime) > 5000) { userSpamCount.set(uid, { count: 1, firstTime: now }); return false; }
+    if (++rec.count > 3) { userSpamCount.set(uid, { count: 1, firstTime: now }); return true; }
     return false;
 }
 
-function addMessageToHistory(chatId, msg) {
-    if (!messageStore.has(chatId)) messageStore.set(chatId, []);
-    const history = messageStore.get(chatId);
-    history.push({ from: msg.author || msg.from, body: msg.body, timestamp: Date.now() });
-    if (history.length > 15) history.shift();
+function addMessageToHistory(cid, msg) {
+    if (!messageStore.has(cid)) messageStore.set(cid, []);
+    const h = messageStore.get(cid);
+    h.push({ from: msg.key.participant || msg.key.remoteJid, body: msg.message?.conversation || msg.message?.extendedTextMessage?.text || '', timestamp: Date.now() });
+    if (h.length > 15) h.shift();
 }
 
-// ---------- CLIENTE ----------
-let client;
-let reconnectAttempt = 0;
+// ---------- CONEXIÓN WHATSAPP ----------
+async function connectToWhatsApp() {
+    const { state, saveCreds } = await useMultiFileAuthState('./auth');
+    const { version } = await fetchLatestBaileysVersion();
 
-function createClient() {
-    return new Client({
-        authStrategy: new LocalAuth(),
-        puppeteer: {
-            headless: true,
-            executablePath: process.env.CHROMIUM_PATH || '/usr/bin/chromium',
-            args: [
-                '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
-                '--disable-gpu', '--no-zygote', '--single-process', '--no-first-run',
-                '--no-default-browser-check', '--disable-extensions', '--disable-background-networking',
-                '--memory-pressure-off', '--disable-ipc-flooding-protection'
-            ]
+    sock = makeWASocket({
+        version,
+        logger,
+        printQRInTerminal: false,
+        auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
+        browser: ['Bot WhatsApp', 'Chrome', '1.0.0']
+    });
+
+    sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect, qr } = update;
+
+        if (qr) {
+            currentQR = qr;
+            console.log('\n📱 QR: ' + (process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`) + '/qr\n');
+            qrcode.generate(qr, { small: true });
+
+            // Intentar código de vinculación
+            try {
+                const code = await sock.requestPairingCode(PHONE_NUMBER);
+                console.log('\n🔑 CÓDIGO:', code, '\n');
+            } catch {}
+        }
+
+        if (connection === 'open') {
+            console.log('✅ BOT CONECTADO Y LISTO');
+            currentQR = null;
+        }
+
+        if (connection === 'close') {
+            const reason = lastDisconnect?.error;
+            console.log('❌ Desconectado:', reason);
+            if (reason?.output?.statusCode !== DisconnectReason.loggedOut) {
+                setTimeout(connectToWhatsApp, 5000);
+            }
         }
     });
-}
 
-// ---------- MANEJADOR DE MENSAJES ----------
-async function handleMessage(msg) {
-    const chat = await msg.getChat();
-    const body = msg.body?.trim() || '';
-    const userId = msg.author || msg.from;
-    const isGroup = chat.isGroup;
-    const botId = client.info.wid._serialized;
+    // ---------- MANEJADOR DE MENSAJES ----------
+    sock.ev.on('messages.upsert', async ({ messages }) => {
+        const msg = messages[0];
+        if (!msg.message || msg.key.fromMe) return;
 
-    console.log(`📩 [${msg.from}] ${body}`);
+        const jid = msg.key.remoteJid;
+        const isGroup = jid.endsWith('@g.us');
+        const body = msg.message?.conversation || msg.message?.extendedTextMessage?.text || msg.message?.imageMessage?.caption || '';
+        const uid = msg.key.participant || jid;
+        const botId = sock.user.id.split(':')[0] + '@s.whatsapp.net';
 
-    if (checkSpam(userId)) {
-        const phrase = spamPhrases[Math.floor(Math.random() * spamPhrases.length)];
-        await chat.sendMessage(phrase);
-        return;
-    }
+        console.log(`📩 [${jid}] ${body}`);
 
-    if (isGroup) addMessageToHistory(msg.from, msg);
+        if (!body) return;
 
-    const isCommand = body.startsWith('#') || body.startsWith('/');
+        if (checkSpam(uid)) {
+            await sock.sendMessage(jid, { text: spamPhrases[Math.floor(Math.random() * spamPhrases.length)] });
+            return;
+        }
 
-    if (isCommand) {
+        if (isGroup) addMessageToHistory(jid, msg);
+
+        const isCmd = body.startsWith('#') || body.startsWith('/');
+        if (!isCmd) {
+            const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+            if (mentioned.includes(botId)) {
+                await sock.sendPresenceUpdate('composing', jid);
+                await delay(3000 + Math.random() * 2000);
+                const p = personalityMap.get(jid) || 'pana';
+                try {
+                    const r = await model.generateContent(`Te mencionaron. Personalidad: ${p}. Mensaje: "${body}". Responde en español. No menciones IA.`);
+                    await sock.sendMessage(jid, { text: r.response.text() });
+                } catch {}
+                return;
+            }
+            if (!isGroup && body) {
+                await sock.sendPresenceUpdate('composing', jid);
+                await delay(3000 + Math.random() * 2000);
+                const p = personalityMap.get(jid) || 'pana';
+                try {
+                    const r = await model.generateContent(`Amigo. Personalidad: ${p}. Mensaje: "${body}". Responde en español. No menciones IA.`);
+                    await sock.sendMessage(jid, { text: r.response.text() });
+                } catch {}
+            }
+            return;
+        }
+
         const args = body.slice(1).split(' ');
         const cmd = args[0].toLowerCase();
-        const argText = args.slice(1).join(' ');
+        const arg = args.slice(1).join(' ');
 
-        if (cmd === 'musica' || cmd === 'descargar') await safeRecording(chat);
-        else await safeTyping(chat);
-
-        if (cmd !== 'start') await delay(3000 + Math.random() * 2000);
-        else await delay(1000);
+        if (cmd === 'musica' || cmd === 'descargar') await sock.sendPresenceUpdate('recording', jid);
+        else await sock.sendPresenceUpdate('composing', jid);
+        await delay(cmd === 'start' ? 1000 : 3000 + Math.random() * 2000);
 
         try {
             switch (cmd) {
-                case 'start': {
-                    const welcome = `🔥 *Bot activo*
-
-Comandos:
-- \`#musica <nombre>\` → Audio de YouTube
-- \`#descargar <link>\` → Descarga video YouTube
-- \`#hablar\` → Respuesta contextual (últimos 15 msgs)
-- \`#pin <término>\` → Imagen de internet
-- \`#meme\` → Meme aleatorio
-- \`#personalidad Seria|Pana\` → Estilo de conversación
-- \`#close\` / \`#open\` → Cerrar/Abrir grupo (solo admins)
-- \`/start\` → Este mensaje
-
-También respondo si me etiquetan.`;
-                    await msg.reply(welcome);
+                case 'start':
+                    await sock.sendMessage(jid, { text: '🔥 *Bot activo*\n\n#musica <nombre>\n#descargar <link>\n#hablar\n#pin <término>\n#meme\n#personalidad Seria|Pana\n#close / #open\n/start' });
                     break;
-                }
-                case 'musica': {
-                    if (!argText) { await msg.reply('⚠️ Escribe el nombre de la canción'); break; }
-                    await msg.reply('🔍 Buscando en YouTube...');
+                case 'musica':
+                    if (!arg) { await sock.sendMessage(jid, { text: '⚠️ Escribe el nombre' }); break; }
+                    await sock.sendMessage(jid, { text: '🔍 Buscando...' });
                     try {
-                        const results = await ytSearch(argText);
-                        const video = results.videos[0];
-                        if (!video) { await msg.reply('❌ No encontré la canción'); break; }
-                        await msg.reply(`🎵 *${video.title}* - Descargando...`);
-                        const audioPath = await downloadAudio(video.url);
-                        const media = MessageMedia.fromFilePath(audioPath);
-                        await client.sendMessage(msg.from, media, { sendAudioAsVoice: true });
-                        fs.promises.unlink(audioPath).catch(() => {});
-                    } catch (err) {
-                        console.error('Error en música:', err);
-                        await msg.reply('❌ Error al buscar/descargar.');
-                    }
+                        const sr = await ytSearch(arg);
+                        const v = sr.videos[0];
+                        if (!v) { await sock.sendMessage(jid, { text: '❌ No encontré' }); break; }
+                        await sock.sendMessage(jid, { text: `🎵 *${v.title}*` });
+                        const ap = await downloadAudio(v.url);
+                        await sock.sendMessage(jid, { audio: { url: ap }, mimetype: 'audio/mp4', ptt: true });
+                        fs.promises.unlink(ap).catch(() => {});
+                    } catch { await sock.sendMessage(jid, { text: '❌ Error' }); }
                     break;
-                }
-                case 'descargar': {
-                    if (!argText) { await msg.reply('⚠️ Proporciona un enlace de YouTube'); break; }
-                    if (!ytdl.validateURL(argText)) {
-                        await msg.reply('❌ Por ahora solo soporto enlaces de YouTube.');
-                        break;
-                    }
-                    await msg.reply('📥 Descargando video...');
+                case 'descargar':
+                    if (!arg) { await sock.sendMessage(jid, { text: '⚠️ Pega el link' }); break; }
+                    if (!ytdl.validateURL(arg)) { await sock.sendMessage(jid, { text: '❌ Solo YouTube' }); break; }
+                    await sock.sendMessage(jid, { text: '📥 Descargando...' });
                     try {
-                        const videoPath = await downloadVideo(argText);
-                        const media = MessageMedia.fromFilePath(videoPath);
-                        await client.sendMessage(msg.from, media, { caption: 'Aquí tienes tu video' });
-                        fs.promises.unlink(videoPath).catch(() => {});
-                    } catch (err) {
-                        console.error('Error descargando:', err);
-                        await msg.reply('❌ Error al descargar.');
-                    }
+                        const vp = await downloadVideo(arg);
+                        await sock.sendMessage(jid, { video: { url: vp }, caption: 'Aquí tienes' });
+                        fs.promises.unlink(vp).catch(() => {});
+                    } catch { await sock.sendMessage(jid, { text: '❌ Error' }); }
                     break;
-                }
-                case 'hablar': {
-                    const personality = personalityMap.get(msg.from) || 'pana';
+                case 'hablar':
+                    const pers = personalityMap.get(jid) || 'pana';
                     let prompt;
                     if (isGroup) {
-                        const history = messageStore.get(msg.from) || [];
-                        const context = history.slice(-15).map(m => `${m.from}: ${m.body}`).join('\n');
-                        prompt = `Eres un amigo en un grupo de WhatsApp. Personalidad: ${personality}. Responde al último mensaje considerando este contexto:\n${context}\nNo menciones que eres una IA. Sé natural. Responde en español.`;
+                        const ctx = (messageStore.get(jid) || []).slice(-15).map(m => `${m.from}: ${m.body}`).join('\n');
+                        prompt = `Amigo en grupo. Personalidad: ${pers}. Contexto:\n${ctx}\nResponde en español. No menciones IA.`;
                     } else {
-                        prompt = `Eres un amigo personal. Personalidad: ${personality}. Responde: "${body.slice(7).trim()}". No menciones IA. Responde en español.`;
+                        prompt = `Amigo personal. Personalidad: ${pers}. Mensaje: "${arg}". Responde en español. No menciones IA.`;
                     }
                     try {
-                        const result = await model.generateContent(prompt);
-                        await msg.reply(result.response.text());
-                    } catch (err) {
-                        console.error('Error en Gemini:', err.message);
-                        try {
-                            console.log('🔄 Reintentando con gemini-pro...');
-                            const fallbackModel = genAI.getGenerativeModel({ model: "gemini-pro" });
-                            const result = await fallbackModel.generateContent(prompt);
-                            await msg.reply(result.response.text());
-                        } catch (fallbackErr) {
-                            await msg.reply('❌ Error al generar respuesta.');
-                        }
-                    }
+                        const r = await model.generateContent(prompt);
+                        await sock.sendMessage(jid, { text: r.response.text() });
+                    } catch { await sock.sendMessage(jid, { text: '❌ Error IA' }); }
                     break;
-                }
-                case 'pin': {
-                    if (!argText) { await msg.reply('⚠️ Dime qué imagen buscar'); break; }
-                    await msg.reply(`🔍 Buscando imagen de "${argText}"...`);
-                    const imgUrl = await searchImage(argText);
-                    try {
-                        const media = await MessageMedia.fromUrl(imgUrl, { unsafeMime: true });
-                        await client.sendMessage(msg.from, media, { caption: `🖼️ ${argText}` });
-                    } catch (err) {
-                        console.error('Error enviando imagen:', err);
-                        await msg.reply('❌ No se pudo enviar la imagen.');
-                    }
+                case 'pin':
+                    if (!arg) { await sock.sendMessage(jid, { text: '⚠️ Dime qué buscar' }); break; }
+                    await sock.sendMessage(jid, { text: `🔍 Buscando "${arg}"...` });
+                    const img = await searchImage(arg);
+                    try { await sock.sendMessage(jid, { image: { url: img }, caption: `🖼️ ${arg}` }); }
+                    catch { await sock.sendMessage(jid, { text: '❌ No se pudo enviar' }); }
                     break;
-                }
-                case 'meme': {
-                    await msg.reply('🔍 Buscando meme...');
-                    const memeUrl = await getRandomMeme();
-                    if (!memeUrl) { await msg.reply('❌ No pude obtener un meme ahora.'); break; }
-                    const media = await MessageMedia.fromUrl(memeUrl, { unsafeMime: true });
-                    await client.sendMessage(msg.from, media, { caption: 'Meme del día' });
+                case 'meme':
+                    await sock.sendMessage(jid, { text: '🔍 Buscando meme...' });
+                    const mu = await getRandomMeme();
+                    if (!mu) { await sock.sendMessage(jid, { text: '❌ No disponible' }); break; }
+                    await sock.sendMessage(jid, { image: { url: mu }, caption: 'Meme' });
                     break;
-                }
-                case 'personalidad': {
-                    const tipo = argText.toLowerCase();
-                    if (tipo === 'seria') {
-                        personalityMap.set(msg.from, 'seria');
-                        await msg.reply('🧑‍💼 Modo serio activado.');
-                    } else if (tipo === 'pana') {
-                        personalityMap.set(msg.from, 'pana');
-                        await msg.reply('😈 Modo pana activado.');
-                    } else {
-                        await msg.reply('⚠️ Usa: #personalidad Seria o #personalidad Pana');
-                    }
+                case 'personalidad':
+                    const t = arg.toLowerCase();
+                    if (t === 'seria') { personalityMap.set(jid, 'seria'); await sock.sendMessage(jid, { text: '🧑‍💼 Modo serio' }); }
+                    else if (t === 'pana') { personalityMap.set(jid, 'pana'); await sock.sendMessage(jid, { text: '😈 Modo pana' }); }
+                    else await sock.sendMessage(jid, { text: '⚠️ Seria o Pana' });
                     break;
-                }
-                case 'close': {
-                    if (!isGroup) { await msg.reply('❌ Solo en grupos'); break; }
-                    const authorId = msg.author || msg.from;
-                    await chat.fetchMessages({ limit: 1 });
-                    const participant = chat.participants.find(p => {
-                        const pId = p.id._serialized || p.id.user || p.id;
-                        return pId === authorId || pId.includes(authorId.split('@')[0]) || authorId.includes(pId.split('@')[0]);
-                    });
-                    if (!participant || !participant.isAdmin) {
-                        await msg.reply('❌ Solo administradores');
-                        break;
-                    }
-                    await chat.setMessagesAdminsOnly(true);
-                    await msg.reply('🔒 Grupo cerrado');
+                case 'close':
+                    if (!isGroup) { await sock.sendMessage(jid, { text: '❌ Solo grupos' }); break; }
+                    const gMeta = await sock.groupMetadata(jid);
+                    const cP = gMeta.participants.find(p => p.id === uid);
+                    if (!cP?.admin) { await sock.sendMessage(jid, { text: '❌ Solo admins' }); break; }
+                    await sock.groupSettingUpdate(jid, 'announcement');
+                    await sock.sendMessage(jid, { text: '🔒 Grupo cerrado' });
                     break;
-                }
-                case 'open': {
-                    if (!isGroup) { await msg.reply('❌ Solo en grupos'); break; }
-                    const authorId = msg.author || msg.from;
-                    await chat.fetchMessages({ limit: 1 });
-                    const participant = chat.participants.find(p => {
-                        const pId = p.id._serialized || p.id.user || p.id;
-                        return pId === authorId || pId.includes(authorId.split('@')[0]) || authorId.includes(pId.split('@')[0]);
-                    });
-                    if (!participant || !participant.isAdmin) {
-                        await msg.reply('❌ Solo administradores');
-                        break;
-                    }
-                    await chat.setMessagesAdminsOnly(false);
-                    await msg.reply('🔓 Grupo abierto');
+                case 'open':
+                    if (!isGroup) { await sock.sendMessage(jid, { text: '❌ Solo grupos' }); break; }
+                    const gMeta2 = await sock.groupMetadata(jid);
+                    const oP = gMeta2.participants.find(p => p.id === uid);
+                    if (!oP?.admin) { await sock.sendMessage(jid, { text: '❌ Solo admins' }); break; }
+                    await sock.groupSettingUpdate(jid, 'not_announcement');
+                    await sock.sendMessage(jid, { text: '🔓 Grupo abierto' });
                     break;
-                }
                 default:
-                    await msg.reply('❓ Comando no existente');
+                    await sock.sendMessage(jid, { text: '❓ Comando no existente' });
             }
         } catch (err) {
-            console.error('Error en comando:', err);
-            await msg.reply('❌ Error al procesar el comando.');
+            console.error('Error:', err);
+            await sock.sendMessage(jid, { text: '❌ Error' });
         }
-        return;
-    }
-
-    // Menciones
-    if (msg.mentionedIds.includes(botId)) {
-        await safeTyping(chat);
-        await delay(3000 + Math.random() * 2000);
-        const personality = personalityMap.get(msg.from) || 'pana';
-        const prompt = `Te mencionaron. Personalidad: ${personality}. Mensaje: "${body}". Responde en español. No menciones IA.`;
-        try {
-            const result = await model.generateContent(prompt);
-            await msg.reply(result.response.text());
-        } catch (err) {
-            console.error('Error en mención:', err);
-        }
-        return;
-    }
-
-    // Chat privado
-    if (!isGroup && body) {
-        await safeTyping(chat);
-        await delay(3000 + Math.random() * 2000);
-        const personality = personalityMap.get(msg.from) || 'pana';
-        const prompt = `Eres un amigo. Personalidad: ${personality}. Mensaje: "${body}". Responde en español. No menciones IA.`;
-        try {
-            const result = await model.generateContent(prompt);
-            await msg.reply(result.response.text());
-        } catch (err) {
-            console.error('Error en respuesta privada:', err);
-        }
-    }
+    });
 }
 
-// ---------- MANEJO DE ERRORES ----------
-process.on('unhandledRejection', (reason) => console.error('🔥 Unhandled Rejection:', reason));
-process.on('uncaughtException', (err) => console.error('🔥 Uncaught Exception:', err));
-
-// ---------- INICIALIZACIÓN ----------
-async function initialize() {
-    client = createClient();
-
-    client.on('qr', async (qr) => {
-        // Guardar QR para mostrarlo en la web
-        currentQR = qr;
-        
-        console.log('\n📱 QR DISPONIBLE. Ábrelo en tu navegador:');
-        console.log(`👉 ${process.env.RENDER_EXTERNAL_URL || 'http://localhost:' + PORT}/qr`);
-        console.log('\nO escanea el QR de abajo:\n');
-        qrcode.generate(qr, { small: true });
-        
-        // Intentar código también
-        try {
-            const pairingCode = await client.requestPairingCode(PHONE_NUMBER);
-            console.log('\n🔑 CÓDIGO DE VINCULACIÓN:', pairingCode);
-        } catch (err) {
-            console.log('⚠️  Usa el QR en la URL de arriba');
-        }
-    });
-
-    client.on('ready', () => {
-        console.log('✅ BOT CONECTADO Y LISTO');
-        currentQR = null;
-        reconnectAttempt = 0;
-    });
-
-    client.on('disconnected', async (reason) => {
-        console.log(`❌ Desconectado: ${reason}`);
-        currentQR = null;
-        await reconnect();
-    });
-
-    client.on('message', async (msg) => {
-        if (msg.fromMe || msg.isStatus) return;
-        messageQueue.run(() => handleMessage(msg));
-    });
-
-    try {
-        await client.initialize();
-    } catch (err) {
-        console.error('Error al inicializar:', err);
-        await reconnect();
-    }
-}
-
-async function reconnect() {
-    const delayMs = Math.min(5000 * Math.pow(2, reconnectAttempt), 300000);
-    reconnectAttempt++;
-    console.log(`🔁 Reintentando en ${delayMs / 1000}s...`);
-    setTimeout(async () => {
-        try { if (client) await client.destroy(); } catch (_) {}
-        await initialize();
-    }, delayMs);
-}
-
-initialize();
+connectToWhatsApp();
