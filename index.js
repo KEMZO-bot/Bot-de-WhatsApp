@@ -12,11 +12,11 @@ import Pino from 'pino';
 const logger = Pino({ level: 'silent' });
 
 // ---------- CONFIGURACIÓN ----------
-const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const PHONE_NUMBER = process.env.PHONE_NUMBER || '584129684011';
 
-if (!DEEPSEEK_API_KEY) {
-    console.error('❌ ERROR: DEEPSEEK_API_KEY no está configurada');
+if (!OPENROUTER_API_KEY) {
+    console.error('❌ ERROR: OPENROUTER_API_KEY no está configurada');
     process.exit(1);
 }
 
@@ -36,32 +36,29 @@ const server = http.createServer((req, res) => {
 });
 server.listen(PORT, () => console.log(`🌐 Servidor en puerto ${PORT}`));
 
-// ---------- IA (DeepSeek) ----------
+// ---------- IA (OpenRouter - GRATIS) ----------
 async function generarRespuesta(prompt) {
-    try {
-        const res = await axios.post('https://api.deepseek.com/v1/chat/completions', {
-            model: 'deepseek-chat',
-            messages: [
-                { role: 'system', content: 'Eres un asistente amigable que habla español. Responde de forma natural y corta. No menciones que eres una IA a menos que te pregunten directamente.' },
-                { role: 'user', content: prompt }
-            ],
-            max_tokens: 500,
-            temperature: 0.7
-        }, {
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${DEEPSEEK_API_KEY}`
-            },
-            timeout: 30000
-        });
-        return res.data.choices[0].message.content;
-    } catch (err) {
-        console.error('Error DeepSeek:', err.response?.data || err.message);
-        throw err;
-    }
+    const res = await axios.post('https://openrouter.ai/api/v1/chat/completions', {
+        model: 'google/gemini-2.0-flash-001',
+        messages: [
+            { role: 'system', content: 'Eres un asistente amigable que habla español. Responde natural y corto. No menciones que eres IA.' },
+            { role: 'user', content: prompt }
+        ],
+        max_tokens: 500,
+        temperature: 0.7
+    }, {
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+            'HTTP-Referer': 'https://bot-whatsapp-lckp.onrender.com',
+            'X-Title': 'WhatsApp Bot'
+        },
+        timeout: 30000
+    });
+    return res.data.choices[0].message.content;
 }
 
-console.log('✅ IA DeepSeek configurada');
+console.log('✅ IA OpenRouter configurada (gratis)');
 
 // ---------- ESTADOS ----------
 const messageStore = new Map();
@@ -230,7 +227,7 @@ async function connectToWhatsApp() {
         try {
             switch (cmd) {
                 case 'start':
-                    await sock.sendMessage(jid, { text: '🔥 *Bot activo con DeepSeek*\n\n#musica <nombre>\n#descargar <link>\n#hablar\n#pin <término>\n#meme\n#personalidad Seria|Pana\n#close / #open\n/start' });
+                    await sock.sendMessage(jid, { text: '🔥 *Bot activo*\n\n#musica <nombre>\n#descargar <link>\n#hablar\n#pin <término>\n#meme\n#personalidad Seria|Pana\n#close / #open\n/start' });
                     break;
                 case 'musica':
                     if (!arg) { await sock.sendMessage(jid, { text: '⚠️ Escribe el nombre de la canción' }); break; }
@@ -239,12 +236,15 @@ async function connectToWhatsApp() {
                         const sr = await ytSearch(arg);
                         const v = sr.videos[0];
                         if (!v) { await sock.sendMessage(jid, { text: '❌ No encontré' }); break; }
-                        if (v.seconds > 300) { await sock.sendMessage(jid, { text: `❌ Máximo 5 minutos` }); break; }
-                        await sock.sendMessage(jid, { text: `🎵 *${v.title}*` });
+                        if (v.seconds > 300) { await sock.sendMessage(jid, { text: `❌ *${v.title}* dura ${Math.floor(v.seconds/60)} min. Máximo 5 min.` }); break; }
+                        await sock.sendMessage(jid, { text: `🎵 *${v.title}* - Descargando...` });
                         const ap = await downloadAudio(v.url);
                         await sock.sendMessage(jid, { audio: fs.readFileSync(ap), mimetype: 'audio/mp4', ptt: true });
                         fs.promises.unlink(ap).catch(() => {});
-                    } catch { await sock.sendMessage(jid, { text: '❌ Error' }); }
+                    } catch (err) {
+                        console.error('Error música:', err.message);
+                        await sock.sendMessage(jid, { text: '❌ Error al descargar' });
+                    }
                     break;
                 case 'descargar':
                     if (!arg) { await sock.sendMessage(jid, { text: '⚠️ Pega el link' }); break; }
@@ -275,7 +275,7 @@ async function connectToWhatsApp() {
                     break;
                 case 'pin':
                     if (!arg) { await sock.sendMessage(jid, { text: '⚠️ Dime qué buscar' }); break; }
-                    await sock.sendMessage(jid, { text: `🔍 Buscando "${arg}"...` });
+                    await sock.sendMessage(jid, { text: `🔍 Buscando imagen de "${arg}"...` });
                     const img = await searchImage(arg);
                     try { await sock.sendMessage(jid, { image: { url: img }, caption: `🖼️ ${arg}` }); }
                     catch { await sock.sendMessage(jid, { text: '❌ No se pudo enviar' }); }
