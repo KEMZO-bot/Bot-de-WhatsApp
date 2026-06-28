@@ -3,7 +3,6 @@ import fs from 'fs';
 import path from 'path';
 import http from 'http';
 import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } from '@whiskeysockets/baileys';
-import { GoogleGenerativeAI } from '@google/generative-ai';
 import ytdl from 'ytdl-core';
 import ytSearch from 'yt-search';
 import axios from 'axios';
@@ -13,11 +12,11 @@ import Pino from 'pino';
 const logger = Pino({ level: 'silent' });
 
 // ---------- CONFIGURACIÓN ----------
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
 const PHONE_NUMBER = process.env.PHONE_NUMBER || '584129684011';
 
-if (!GEMINI_API_KEY) {
-    console.error('❌ ERROR: GEMINI_API_KEY no está configurada');
+if (!DEEPSEEK_API_KEY) {
+    console.error('❌ ERROR: DEEPSEEK_API_KEY no está configurada');
     process.exit(1);
 }
 
@@ -37,11 +36,32 @@ const server = http.createServer((req, res) => {
 });
 server.listen(PORT, () => console.log(`🌐 Servidor en puerto ${PORT}`));
 
-// ---------- IA ----------
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-const MODEL_NAME = "gemini-2.0-flash";
-const model = genAI.getGenerativeModel({ model: MODEL_NAME });
-console.log('✅ Modelo IA: ' + MODEL_NAME);
+// ---------- IA (DeepSeek) ----------
+async function generarRespuesta(prompt) {
+    try {
+        const res = await axios.post('https://api.deepseek.com/v1/chat/completions', {
+            model: 'deepseek-chat',
+            messages: [
+                { role: 'system', content: 'Eres un asistente amigable que habla español. Responde de forma natural y corta. No menciones que eres una IA a menos que te pregunten directamente.' },
+                { role: 'user', content: prompt }
+            ],
+            max_tokens: 500,
+            temperature: 0.7
+        }, {
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${DEEPSEEK_API_KEY}`
+            },
+            timeout: 30000
+        });
+        return res.data.choices[0].message.content;
+    } catch (err) {
+        console.error('Error DeepSeek:', err.response?.data || err.message);
+        throw err;
+    }
+}
+
+console.log('✅ IA DeepSeek configurada');
 
 // ---------- ESTADOS ----------
 const messageStore = new Map();
@@ -55,7 +75,7 @@ function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 async function downloadAudio(url) {
     const fp = path.join('/tmp', `audio_${Date.now()}.mp3`);
     return new Promise((resolve, reject) => {
-        const s = ytdl(url, { filter: 'audioonly', quality: 'lowestaudio', highWaterMark: 1 << 16 });
+        const s = ytdl(url, { filter: 'audioonly', quality: 'lowestaudio', highWaterMark: 1 << 14 });
         const w = fs.createWriteStream(fp);
         s.pipe(w);
         w.on('finish', () => resolve(fp));
@@ -67,7 +87,7 @@ async function downloadAudio(url) {
 async function downloadVideo(url) {
     const fp = path.join('/tmp', `video_${Date.now()}.mp4`);
     return new Promise((resolve, reject) => {
-        const s = ytdl(url, { quality: 'lowest', highWaterMark: 1 << 16 });
+        const s = ytdl(url, { quality: 'lowest', highWaterMark: 1 << 14 });
         const w = fs.createWriteStream(fp);
         s.pipe(w);
         w.on('finish', () => resolve(fp));
@@ -80,30 +100,15 @@ async function searchImage(query) {
     console.log(`🔍 Buscando imagen: "${query}"`);
     try {
         const r = await axios.get('https://pixabay.com/api/', { params: { key: '25516218-6e8b5e2a1f1c3d0e8b5e2a1f1', q: query, per_page: 3, safesearch: 'true' }, timeout: 10000 });
-        if (r.data.hits?.length) {
-            console.log('✅ Imagen encontrada en Pixabay');
-            return r.data.hits[0].largeImageURL || r.data.hits[0].webformatURL;
-        }
-    } catch (err) {
-        console.log('⚠️ Pixabay falló:', err.message);
-    }
-    console.log('⚠️ Usando Unsplash como respaldo');
+        if (r.data.hits?.length) return r.data.hits[0].largeImageURL || r.data.hits[0].webformatURL;
+    } catch {}
     return `https://source.unsplash.com/800x600/?${encodeURIComponent(query)}`;
 }
 
 async function getRandomMeme() {
-    try { 
-        const r = await axios.get('https://meme-api.com/gimme/memesesp', { timeout: 10000 });
-        if (r.data?.url) return r.data.url;
-    } catch {}
-    try { 
-        const r = await axios.get('https://meme-api.com/gimme/spanishmemes', { timeout: 10000 });
-        if (r.data?.url) return r.data.url;
-    } catch {}
-    try { 
-        const r = await axios.get('https://meme-api.com/gimme', { timeout: 10000 });
-        return r.data.url;
-    } catch { return null; }
+    try { const r = await axios.get('https://meme-api.com/gimme/memesesp', { timeout: 10000 }); if (r.data?.url) return r.data.url; } catch {}
+    try { const r = await axios.get('https://meme-api.com/gimme/spanishmemes', { timeout: 10000 }); if (r.data?.url) return r.data.url; } catch {}
+    try { const r = await axios.get('https://meme-api.com/gimme', { timeout: 10000 }); return r.data.url; } catch { return null; }
 }
 
 function checkSpam(uid) {
@@ -143,7 +148,6 @@ async function connectToWhatsApp() {
             currentQR = qr;
             console.log('\n📱 QR: ' + (process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`) + '/qr\n');
             qrcode.generate(qr, { small: true });
-
             try {
                 const code = await sock.requestPairingCode(PHONE_NUMBER);
                 console.log('\n🔑 CÓDIGO:', code, '\n');
@@ -194,8 +198,8 @@ async function connectToWhatsApp() {
                 await delay(3000 + Math.random() * 2000);
                 const p = personalityMap.get(jid) || 'pana';
                 try {
-                    const r = await model.generateContent(`Te mencionaron. Personalidad: ${p}. Mensaje: "${body}". Responde en español. No menciones IA.`);
-                    await sock.sendMessage(jid, { text: r.response.text() });
+                    const respuesta = await generarRespuesta(`Te mencionaron en un grupo. Personalidad: ${p}. Mensaje: "${body}". Responde en español.`);
+                    await sock.sendMessage(jid, { text: respuesta });
                 } catch (err) {
                     console.error('Error mención:', err.message);
                 }
@@ -206,8 +210,8 @@ async function connectToWhatsApp() {
                 await delay(3000 + Math.random() * 2000);
                 const p = personalityMap.get(jid) || 'pana';
                 try {
-                    const r = await model.generateContent(`Amigo. Personalidad: ${p}. Mensaje: "${body}". Responde en español. No menciones IA.`);
-                    await sock.sendMessage(jid, { text: r.response.text() });
+                    const respuesta = await generarRespuesta(`Eres un amigo. Personalidad: ${p}. Mensaje: "${body}". Responde en español.`);
+                    await sock.sendMessage(jid, { text: respuesta });
                 } catch (err) {
                     console.error('Error chat:', err.message);
                 }
@@ -226,102 +230,90 @@ async function connectToWhatsApp() {
         try {
             switch (cmd) {
                 case 'start':
-                    await sock.sendMessage(jid, { text: '🔥 *Bot activo*\n\n#musica <nombre>\n#descargar <link>\n#hablar\n#pin <término>\n#meme\n#personalidad Seria|Pana\n#close / #open\n/start' });
+                    await sock.sendMessage(jid, { text: '🔥 *Bot activo con DeepSeek*\n\n#musica <nombre>\n#descargar <link>\n#hablar\n#pin <término>\n#meme\n#personalidad Seria|Pana\n#close / #open\n/start' });
                     break;
                 case 'musica':
                     if (!arg) { await sock.sendMessage(jid, { text: '⚠️ Escribe el nombre de la canción' }); break; }
-                    await sock.sendMessage(jid, { text: '🔍 Buscando en YouTube...' });
+                    await sock.sendMessage(jid, { text: '🔍 Buscando...' });
                     try {
                         const sr = await ytSearch(arg);
                         const v = sr.videos[0];
-                        if (!v) { await sock.sendMessage(jid, { text: '❌ No encontré la canción' }); break; }
-                        await sock.sendMessage(jid, { text: `🎵 *${v.title}* - Descargando...` });
+                        if (!v) { await sock.sendMessage(jid, { text: '❌ No encontré' }); break; }
+                        if (v.seconds > 300) { await sock.sendMessage(jid, { text: `❌ Máximo 5 minutos` }); break; }
+                        await sock.sendMessage(jid, { text: `🎵 *${v.title}*` });
                         const ap = await downloadAudio(v.url);
-                        await sock.sendMessage(jid, { 
-                            audio: fs.readFileSync(ap), 
-                            mimetype: 'audio/mp4', 
-                            ptt: true 
-                        });
+                        await sock.sendMessage(jid, { audio: fs.readFileSync(ap), mimetype: 'audio/mp4', ptt: true });
                         fs.promises.unlink(ap).catch(() => {});
-                    } catch (err) {
-                        console.error('Error música:', err);
-                        await sock.sendMessage(jid, { text: '❌ Error al descargar la música' });
-                    }
+                    } catch { await sock.sendMessage(jid, { text: '❌ Error' }); }
                     break;
                 case 'descargar':
-                    if (!arg) { await sock.sendMessage(jid, { text: '⚠️ Pega el enlace de YouTube' }); break; }
-                    if (!ytdl.validateURL(arg)) { await sock.sendMessage(jid, { text: '❌ Solo soporto enlaces de YouTube' }); break; }
-                    await sock.sendMessage(jid, { text: '📥 Descargando video...' });
+                    if (!arg) { await sock.sendMessage(jid, { text: '⚠️ Pega el link' }); break; }
+                    if (!ytdl.validateURL(arg)) { await sock.sendMessage(jid, { text: '❌ Solo YouTube' }); break; }
+                    await sock.sendMessage(jid, { text: '📥 Descargando...' });
                     try {
                         const vp = await downloadVideo(arg);
-                        await sock.sendMessage(jid, { 
-                            video: fs.readFileSync(vp), 
-                            caption: 'Aquí tienes tu video' 
-                        });
+                        await sock.sendMessage(jid, { video: fs.readFileSync(vp), caption: 'Aquí tienes' });
                         fs.promises.unlink(vp).catch(() => {});
-                    } catch (err) {
-                        console.error('Error video:', err);
-                        await sock.sendMessage(jid, { text: '❌ Error al descargar el video' });
-                    }
+                    } catch { await sock.sendMessage(jid, { text: '❌ Error' }); }
                     break;
                 case 'hablar':
                     const pers = personalityMap.get(jid) || 'pana';
                     let prompt;
                     if (isGroup) {
                         const ctx = (messageStore.get(jid) || []).slice(-15).map(m => `${m.from}: ${m.body}`).join('\n');
-                        prompt = `Amigo en grupo. Personalidad: ${pers}. Contexto:\n${ctx}\nResponde en español. No menciones IA.`;
+                        prompt = `Amigo en grupo. Personalidad: ${pers}. Contexto:\n${ctx}\nResponde en español.`;
                     } else {
-                        prompt = `Amigo personal. Personalidad: ${pers}. Mensaje: "${arg}". Responde en español. No menciones IA.`;
+                        prompt = `Amigo personal. Personalidad: ${pers}. Mensaje: "${arg}". Responde en español.`;
                     }
                     try {
-                        const r = await model.generateContent(prompt);
-                        await sock.sendMessage(jid, { text: r.response.text() });
+                        const respuesta = await generarRespuesta(prompt);
+                        await sock.sendMessage(jid, { text: respuesta });
                     } catch (err) {
                         console.error('Error hablar:', err.message);
-                        await sock.sendMessage(jid, { text: '❌ Error IA: ' + err.message.substring(0, 80) });
+                        await sock.sendMessage(jid, { text: '❌ Error IA' });
                     }
                     break;
                 case 'pin':
-                    if (!arg) { await sock.sendMessage(jid, { text: '⚠️ Dime qué imagen buscar' }); break; }
-                    await sock.sendMessage(jid, { text: `🔍 Buscando imagen de "${arg}"...` });
+                    if (!arg) { await sock.sendMessage(jid, { text: '⚠️ Dime qué buscar' }); break; }
+                    await sock.sendMessage(jid, { text: `🔍 Buscando "${arg}"...` });
                     const img = await searchImage(arg);
                     try { await sock.sendMessage(jid, { image: { url: img }, caption: `🖼️ ${arg}` }); }
-                    catch { await sock.sendMessage(jid, { text: '❌ No se pudo enviar la imagen' }); }
+                    catch { await sock.sendMessage(jid, { text: '❌ No se pudo enviar' }); }
                     break;
                 case 'meme':
                     await sock.sendMessage(jid, { text: '🔍 Buscando meme...' });
                     const mu = await getRandomMeme();
-                    if (!mu) { await sock.sendMessage(jid, { text: '❌ No hay memes disponibles' }); break; }
+                    if (!mu) { await sock.sendMessage(jid, { text: '❌ No disponible' }); break; }
                     await sock.sendMessage(jid, { image: { url: mu }, caption: 'Meme del día' });
                     break;
                 case 'personalidad':
                     const t = arg.toLowerCase();
-                    if (t === 'seria') { personalityMap.set(jid, 'seria'); await sock.sendMessage(jid, { text: '🧑‍💼 Modo serio activado' }); }
-                    else if (t === 'pana') { personalityMap.set(jid, 'pana'); await sock.sendMessage(jid, { text: '😈 Modo pana activado' }); }
-                    else await sock.sendMessage(jid, { text: '⚠️ Usa: #personalidad Seria o #personalidad Pana' });
+                    if (t === 'seria') { personalityMap.set(jid, 'seria'); await sock.sendMessage(jid, { text: '🧑‍💼 Modo serio' }); }
+                    else if (t === 'pana') { personalityMap.set(jid, 'pana'); await sock.sendMessage(jid, { text: '😈 Modo pana' }); }
+                    else await sock.sendMessage(jid, { text: '⚠️ Seria o Pana' });
                     break;
                 case 'close':
-                    if (!isGroup) { await sock.sendMessage(jid, { text: '❌ Solo funciona en grupos' }); break; }
+                    if (!isGroup) { await sock.sendMessage(jid, { text: '❌ Solo grupos' }); break; }
                     const gMeta = await sock.groupMetadata(jid);
                     const cP = gMeta.participants.find(p => p.id === uid);
-                    if (!cP?.admin) { await sock.sendMessage(jid, { text: '❌ Solo administradores' }); break; }
+                    if (!cP?.admin) { await sock.sendMessage(jid, { text: '❌ Solo admins' }); break; }
                     await sock.groupSettingUpdate(jid, 'announcement');
-                    await sock.sendMessage(jid, { text: '🔒 Grupo cerrado: solo admins pueden enviar mensajes' });
+                    await sock.sendMessage(jid, { text: '🔒 Grupo cerrado' });
                     break;
                 case 'open':
-                    if (!isGroup) { await sock.sendMessage(jid, { text: '❌ Solo funciona en grupos' }); break; }
+                    if (!isGroup) { await sock.sendMessage(jid, { text: '❌ Solo grupos' }); break; }
                     const gMeta2 = await sock.groupMetadata(jid);
                     const oP = gMeta2.participants.find(p => p.id === uid);
-                    if (!oP?.admin) { await sock.sendMessage(jid, { text: '❌ Solo administradores' }); break; }
+                    if (!oP?.admin) { await sock.sendMessage(jid, { text: '❌ Solo admins' }); break; }
                     await sock.groupSettingUpdate(jid, 'not_announcement');
-                    await sock.sendMessage(jid, { text: '🔓 Grupo abierto: todos pueden enviar mensajes' });
+                    await sock.sendMessage(jid, { text: '🔓 Grupo abierto' });
                     break;
                 default:
                     await sock.sendMessage(jid, { text: '❓ Comando no existente' });
             }
         } catch (err) {
             console.error('Error:', err);
-            await sock.sendMessage(jid, { text: '❌ Error al procesar el comando' });
+            await sock.sendMessage(jid, { text: '❌ Error' });
         }
     });
 }
