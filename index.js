@@ -9,7 +9,7 @@ import Pino from 'pino';
 
 const logger = Pino({ level: 'silent' });
 
-const PHONE_NUMBER = process.env.PHONE_NUMBER || '584129684011';
+const PHONE_NUMBER = process.env.PHONE_NUMBER || '+584129684011';
 const PORT = process.env.PORT || 10000;
 let sock = null;
 let currentQR = null;
